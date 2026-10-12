@@ -8,11 +8,11 @@ import numpy as np
 
 from hand_features import create_hand_landmarker, feature_vector, draw_landmarks
 
-STATIC_WINDOW = 8
+STATIC_WINDOW = 20
 STATIC_CONFIDENCE_THRESHOLD = 0.7
 STATIC_CONSISTENCY_THRESHOLD = 0.7
 
-COOLDOWN = 3  # seconds to wait after accepting a letter before accepting again
+COOLDOWN = 3.5  # seconds to wait after accepting a letter before accepting again
 RESET_CONFIDENCE_DROP = 0.3  # confidence must drop below this to record a new letter early
 
 

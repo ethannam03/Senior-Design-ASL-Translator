@@ -1,7 +1,10 @@
 """
 ASL Fingerspelling Reader — recognizes all 26 static + motion ASL alphabet
-handshapes using MediaPipe Holistic hand tracking.
+handshapes using MediaPipe's Tasks API (HandLandmarker).
 
+SETUP (one time):
+    wget -O hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+  Put hand_landmarker.task in the same folder as this script.
 
   - 24 letters (everything except J and Z) are recognized from a single
     still handshape (finger-bend angles, thumb position/depth, fingertip
@@ -96,28 +99,92 @@ import time
 import math
 import csv
 import os
+import sys
 import random
 from collections import deque, Counter
+from enum import IntEnum
+
+import numpy as np
 import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision
 
 
+# ---------------------------------------------------------------------------
+# Setup: MediaPipe Tasks HandLandmarker
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
+if not os.path.exists(MODEL_PATH):
+    sys.exit(
+        f"Missing model file: {MODEL_PATH}\n"
+        "Download it with:\n"
+        "  wget -O hand_landmarker.task https://storage.googleapis.com/mediapipe-models/"
+        "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+    )
 
-# Setup
-mp_holistic = mp.solutions.holistic
-mp_drawing = mp.solutions.drawing_utils
-
-
-holistic_model = mp_holistic.Holistic(
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+landmarker = vision.HandLandmarker.create_from_options(
+    vision.HandLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
 )
 
 
-HandLandmark = mp_holistic.HandLandmark
+class HandLandmark(IntEnum):
+    """Same indices as the old mp.solutions HandLandmark enum, so the rest
+    of the code (HL.WRIST.value, etc.) works unchanged."""
+    WRIST = 0
+    THUMB_CMC = 1
+    THUMB_MCP = 2
+    THUMB_IP = 3
+    THUMB_TIP = 4
+    INDEX_FINGER_MCP = 5
+    INDEX_FINGER_PIP = 6
+    INDEX_FINGER_DIP = 7
+    INDEX_FINGER_TIP = 8
+    MIDDLE_FINGER_MCP = 9
+    MIDDLE_FINGER_PIP = 10
+    MIDDLE_FINGER_DIP = 11
+    MIDDLE_FINGER_TIP = 12
+    RING_FINGER_MCP = 13
+    RING_FINGER_PIP = 14
+    RING_FINGER_DIP = 15
+    RING_FINGER_TIP = 16
+    PINKY_MCP = 17
+    PINKY_PIP = 18
+    PINKY_DIP = 19
+    PINKY_TIP = 20
+
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
+]
+
+
+def draw_hand(image, lm):
+    """Replacement for mp_drawing.draw_landmarks (Tasks API has no helper
+    that works on plain landmark lists)."""
+    h, w = image.shape[:2]
+    pts = [(int(p.x * w), int(p.y * h)) for p in lm]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(image, pts[a], pts[b], (0, 255, 0), 2)
+    for p in pts:
+        cv2.circle(image, p, 3, (0, 0, 255), -1)
 
 
 capture = cv2.VideoCapture(0)
+capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+capture.set(cv2.CAP_PROP_FPS, 30)
 
 
 # Rolling buffer of recent classifications, used to smooth out single-frame
@@ -213,7 +280,8 @@ def curl_state(angle):
 
 
 def extract_features(hand_landmarks):
-    lm = hand_landmarks.landmark
+    # Tasks API returns a plain list of landmarks (no .landmark attribute)
+    lm = hand_landmarks
     HL = HandLandmark
 
 
@@ -1018,6 +1086,8 @@ def draw_test_overlay(image):
 
 
 
+last_timestamp_ms = 0  # detect_for_video needs strictly increasing timestamps
+
 while capture.isOpened():
     ret, frame = capture.read()
     if not ret:
@@ -1028,20 +1098,25 @@ while capture.isOpened():
     frame = cv2.flip(frame, 1)
 
 
-    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    image.flags.writeable = False
-    results = holistic_model.process(image)
-    image.flags.writeable = True
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    image = frame.copy()  # BGR copy we draw overlays on
 
 
-    active_hand = results.right_hand_landmarks or results.left_hand_landmarks
     now = time.time()
+    timestamp_ms = int(now * 1000)
+    if timestamp_ms <= last_timestamp_ms:
+        timestamp_ms = last_timestamp_ms + 1
+    last_timestamp_ms = timestamp_ms
+
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = landmarker.detect_for_video(mp_image, timestamp_ms)
+    active_hand = result.hand_landmarks[0] if result.hand_landmarks else None
 
 
     current_letter = None
     if active_hand:
-        mp_drawing.draw_landmarks(image, active_hand, mp_holistic.HAND_CONNECTIONS)
+        draw_hand(image, active_hand)
         features = extract_features(active_hand)
         current_letter = classify_letter(features, now)
         if debug_mode:
@@ -1163,7 +1238,5 @@ while capture.isOpened():
 
 
 capture.release()
+landmarker.close()
 cv2.destroyAllWindows()
-
-
-

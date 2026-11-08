@@ -41,7 +41,7 @@ def main():
     clf.fit(X_train, y_train)
 
     preds = clf.predict(X_test)
-    print("\n=== Motion (J/Z/NONE) model ===")
+    print("\nMotion model")
     print(classification_report(y_test, preds))
 
     joblib.dump(clf, "motion_only_model.joblib")

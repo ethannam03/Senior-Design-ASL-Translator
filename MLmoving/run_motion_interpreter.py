@@ -1,25 +1,6 @@
 """
 run_motion_interpreter.py
 
-Standalone real-time interpreter for the motion letters only (J, Z). No
-static model involved -- this is purely for testing/debugging the motion
-classifier in isolation before combining it with static letters.
-
-How it works:
-  - Every frame, normalized landmarks get pushed into a rolling buffer
-    (MOTION_WINDOW frames long).
-  - most_active_fingertip_motion() gives a cheap "how much is moving right
-    now" score. Only once that crosses MOTION_ENERGY_THRESHOLD do we
-    bother running the (more expensive) motion classifier on the buffer --
-    most frames nothing is happening, so this keeps CPU low.
-  - The classifier's "NONE" class is filtered out -- it exists only so
-    the model has something to predict when nothing is actually
-    happening; it should never itself become an accepted letter.
-  - After accepting J or Z, we require BOTH the cooldown timer to expire
-    AND the motion energy to drop back down before accepting again --
-    otherwise one gesture could get detected multiple times as the
-    sliding window keeps re-triggering on the same movement.
-
 Keys:
   BACKSPACE  delete last letter
   SPACE      add a space
@@ -41,7 +22,7 @@ from hand_features import (
     FINGERTIPS,
 )
 
-MOTION_WINDOW = 20           # ~0.6-0.8s of frames, tune to your camera fps
+MOTION_WINDOW = 20           # ~0.6-0.8s of frames
 MOTION_ENERGY_THRESHOLD = 0.35
 MOTION_CONFIDENCE_THRESHOLD = 0.65
 
@@ -104,11 +85,9 @@ def main():
 
             energy = most_active_fingertip_motion(motion_buffer)
 
-            # ---- state machine ----
-            # Release cooldown only once BOTH the timer has expired AND
-            # the hand has actually settled down (low energy) -- this is
-            # what stops one J or Z from being accepted multiple times as
-            # the window keeps sliding across the same motion.
+            # state machine
+            # Release cooldown only once both the timer has expired and
+            # the hand has actually settled down (low energy) 
             if state == "COOLDOWN" and now >= cooldown_until and energy < ENERGY_RELEASE_THRESHOLD:
                 state = "READY"
 

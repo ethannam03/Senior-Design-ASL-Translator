@@ -1,30 +1,5 @@
 """
-collect_motion_data.py
-
-Standalone data collection for the motion letters only (J, Z) plus a NONE
-class (ordinary hand movement/jitter that should NOT be mistaken for J or
-Z). No static letters here at all -- this file's only job is building
-motion_only_data.csv.
-
-How to use:
-  1. Press '1', '2', or '3' to pick which class you're about to record
-     (1 = J, 2 = Z, 3 = NONE).
-  2. Press ENTER to start a recording window (MOTION_BUFFER_SECONDS long).
-  3. Perform the gesture during that window:
-       - J: hold the "I" hand shape (pinky up, rest curled) then hook the
-         pinky down and slightly forward.
-       - Z: extend the index finger (like "D") and trace a Z shape in the
-         air -- right, diagonal down-left, right again.
-       - NONE: anything that ISN'T J or Z -- hold a static letter and
-         wiggle slightly, move your hand around idly, adjust your grip,
-         etc. This class is what teaches the model "this is just normal
-         movement, not a real gesture."
-  4. Repeat at least 60-100 times per class, varying speed and size of the
-     gesture, before moving to train_motion_model.py.
-
-Output: motion_only_data.csv
-
-Keys (all non-letter, consistent with the rest of this project):
+Keys:
   1/2/3   set current label to J / Z / NONE
   ENTER   record one motion buffer
   ESC     quit
@@ -44,7 +19,7 @@ from hand_features import (
 )
 
 MOTION_CSV = "motion_only_data.csv"
-MOTION_BUFFER_SECONDS = 1
+MOTION_BUFFER_SECONDS = 0.7
 
 KEY_ESC = 27
 KEY_ENTER = 13
@@ -118,7 +93,7 @@ def main():
                 recording = False
                 buffer = []
 
-        # ---------------- key handling ----------------
+        # key handling
         key = cv2.waitKey(1) & 0xFF
         if key == KEY_ESC:
             break
@@ -134,7 +109,7 @@ def main():
                 record_start = now
                 print(f"Recording '{current_label}'...")
 
-        # ---------------- HUD ----------------
+        # hud
         hud = f"Label: {current_label} | ENTER to record"
         if recording:
             hud += " | RECORDING..."

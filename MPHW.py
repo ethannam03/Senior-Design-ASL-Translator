@@ -1,17 +1,42 @@
 """
-ASL Fingerspelling Reader — recognizes all 26 static + motion ASL alphabet
-handshapes using MediaPipe's Tasks API (HandLandmarker).
+ASL Fingerspelling Reader (Raspberry Pi 5 / desktop) — recognizes all 26 ASL
+alphabet handshapes using MediaPipe's Tasks API (HandLandmarker), and shows
+the live letter plus the confirmed word on an Adafruit ILI9341 TFT.
 
-SETUP (one time):
-    wget -O hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
-  Put hand_landmarker.task in the same folder as this script.
+SETUP ON A RASPBERRY PI 5 (one time):
+  1. Raspberry Pi OS 64-bit (Bookworm), then:
+         sudo apt update
+         sudo apt install -y python3-venv python3-opencv python3-picamera2
+         python3 -m venv --system-site-packages .venv
+         source .venv/bin/activate
+         pip install mediapipe
+     (--system-site-packages is what lets the venv see the apt-installed
+      OpenCV and Picamera2.)
+  2. The hand model is downloaded automatically on first run if it's
+     missing. To do it by hand:
+         wget -O hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+  3. For the TFT display (optional - the script runs fine without it):
+         sudo raspi-config nonint do_spi 0        # then reboot
+         sudo apt install -y fonts-dejavu-core python3-pil
+         pip install adafruit-circuitpython-rgb-display adafruit-blinka
+     The display wiring (SPI0) and the board's IM1/IM2/IM3 = 3.3V, IM0 = GND
+     setting must already be working (your display test shows colors).
+  4. Run from the Pi's desktop (HDMI, VNC, or Pi Connect screen sharing):
+         python MediaPipeASL.py
+
+ENVIRONMENT VARIABLES:
+  ASL_CAMERA=usb|picamera|auto   which camera to use (default auto: Pi
+                                 Camera Module first, then USB webcam)
+  ASL_CAM_INDEX=0                USB webcam index (default 0)
+  ASL_DISPLAY=off                run without the TFT display
+  Example:  ASL_CAMERA=usb python MediaPipeASL.py
 
   - 24 letters (everything except J and Z) are recognized from a single
     still handshape (finger-bend angles, thumb position/depth, fingertip
     spacing, and hand orientation).
   - J and Z are NOT static handshapes — they're defined by a short motion
     trace — so they're recognized separately by watching the fingertip's
-    path over the last ~1 second and matching it against the expected
+    path over the last ~2 seconds and matching it against the expected
     shape:
         J: hold the "I" handshape (pinky up, thumb tucked) and draw a
            small hook/J in the air.
@@ -29,8 +54,8 @@ Controls:
     which stay visible even after your hand moves or leaves the frame.
   - Press BACKSPACE to undo the last confirmed letter.
   - Press 'd' to toggle a debug overlay showing the raw angles/gaps/motion
-    numbers behind the current decision - use this to tune thresholds for
-    your own camera and hand (see TUNING NOTES below).
+    numbers (and FPS) behind the current decision - use this to tune
+    thresholds for your own camera and hand (see TUNING NOTES below).
   - Press 't' to start/stop an ACCURACY TEST: it prompts you through the
     alphabet one letter at a time; sign the prompted letter and press
     SPACE to log whether the live reading matched. Tracks per-letter
@@ -39,6 +64,7 @@ Controls:
     any time you press 's' while in test mode.
   - Press 'n' (while testing) to skip the current letter without logging it.
   - Press 'q' to quit.
+  (Key presses only register when the video window is focused.)
 
 
 IMPORTANT ACCURACY NOTE:
@@ -93,14 +119,23 @@ this script:
 Press 's' any time during a test to save early without stopping it.
 """
 
+import os
+import sys
+
+# Raspberry Pi OS (Bookworm) runs Wayland by default, and Qt-based OpenCV
+# builds can fail to open windows there. Fall back to X11 (XWayland) unless
+# the user already chose a platform. Must be set before cv2 is imported.
+if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY") \
+        and "QT_QPA_PLATFORM" not in os.environ:
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 import cv2
 import time
 import math
 import csv
-import os
-import sys
 import random
+import threading
+import urllib.request
 from collections import deque, Counter
 from enum import IntEnum
 
@@ -111,17 +146,65 @@ from mediapipe.tasks.python import vision
 
 
 # ---------------------------------------------------------------------------
-# Setup: MediaPipe Tasks HandLandmarker
+# Configuration
 # ---------------------------------------------------------------------------
+# Frame size used for capture, processing, and display. 640x480 is a good
+# fit for a Pi 5: hand landmarks don't need more resolution, and a smaller
+# frame means less work per loop. All overlay positions scale from these.
+FRAME_W, FRAME_H = 640, 480
+
+# "auto" (Pi camera first, then USB), "usb", or "picamera".
+CAMERA_SOURCE = os.environ.get("ASL_CAMERA", "auto").lower()
+CAM_INDEX = int(os.environ.get("ASL_CAM_INDEX", "0"))
+
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+             "hand_landmarker/float16/latest/hand_landmarker.task")
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
-if not os.path.exists(MODEL_PATH):
-    sys.exit(
-        f"Missing model file: {MODEL_PATH}\n"
-        "Download it with:\n"
-        "  wget -O hand_landmarker.task https://storage.googleapis.com/mediapipe-models/"
-        "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-    )
+# --- TFT display (ILI9341 on SPI0) ---
+TFT_ENABLED = os.environ.get("ASL_DISPLAY", "on").lower() != "off"
+TFT_CS = None          # None = CE0 (pin 24) driven automatically by the kernel.
+                       # Or a Blinka pin name like "D5" if CS is on a plain GPIO.
+TFT_DC = "D25"         # GPIO25, pin 22
+TFT_RST = "D24"        # GPIO24, pin 18
+TFT_ROTATION = 90      # 90 = 320x240 landscape; try 270 if upside down
+TFT_BAUDRATE = 8_000_000   # raise toward 24_000_000 if your wiring is clean
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+if TFT_ENABLED:
+    try:
+        import board
+        import digitalio
+        from PIL import Image, ImageDraw, ImageFont
+        from adafruit_rgb_display import ili9341
+    except Exception as e:  # missing packages, Blinka platform problems, ...
+        print(f"TFT display disabled (could not import display libraries: {e})")
+        TFT_ENABLED = False
+
+
+# ---------------------------------------------------------------------------
+# Setup: MediaPipe Tasks HandLandmarker
+# ---------------------------------------------------------------------------
+def ensure_model():
+    """Download the hand model next to the script if it isn't there yet."""
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1_000_000:
+        return
+    print(f"Model not found at {MODEL_PATH}; downloading (~8 MB)...")
+    tmp_path = MODEL_PATH + ".part"
+    try:
+        urllib.request.urlretrieve(MODEL_URL, tmp_path)
+        os.replace(tmp_path, MODEL_PATH)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        sys.exit(
+            f"Could not download the model automatically ({e}).\n"
+            "Download it manually with:\n"
+            f"  wget -O hand_landmarker.task {MODEL_URL}"
+        )
+
+
+ensure_model()
 
 landmarker = vision.HandLandmarker.create_from_options(
     vision.HandLandmarkerOptions(
@@ -181,10 +264,211 @@ def draw_hand(image, lm):
         cv2.circle(image, p, 3, (0, 0, 255), -1)
 
 
-capture = cv2.VideoCapture(0)
-capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-capture.set(cv2.CAP_PROP_FPS, 30)
+# ---------------------------------------------------------------------------
+# Camera: Pi Camera Module (Picamera2) or USB webcam (OpenCV/V4L2)
+# ---------------------------------------------------------------------------
+class Camera:
+    """Gives the main loop one simple read() -> (ok, BGR frame) regardless
+    of whether the frames come from a ribbon-cable Pi camera or a USB
+    webcam. On a Pi 5 the ribbon cameras use libcamera, which OpenCV's
+    VideoCapture can't read, so they have to go through Picamera2."""
+
+    def __init__(self, source="auto"):
+        self.picam = None
+        self.cap = None
+        self.kind = None
+
+        if source in ("auto", "picamera"):
+            self._try_picamera()
+        if self.kind is None and source in ("auto", "usb"):
+            self._try_usb()
+        if self.kind is None:
+            sys.exit(
+                "No camera could be opened.\n"
+                "  - Pi Camera Module: check the ribbon cable, and that "
+                "python3-picamera2 is installed (apt) and the venv was made "
+                "with --system-site-packages.\n"
+                "  - USB webcam: check it's plugged in (ls /dev/video*).\n"
+                "  - Force one with ASL_CAMERA=usb or ASL_CAMERA=picamera."
+            )
+        print(f"Using camera: {self.kind}")
+
+    def _try_picamera(self):
+        try:
+            from picamera2 import Picamera2
+            if not Picamera2.global_camera_info():
+                raise RuntimeError("no Pi camera detected")
+            cam = Picamera2()
+            # "RGB888" in Picamera2 is laid out as B,G,R in memory, which
+            # is exactly the channel order OpenCV expects - no conversion.
+            config = cam.create_preview_configuration(
+                main={"size": (FRAME_W, FRAME_H), "format": "RGB888"}
+            )
+            cam.configure(config)
+            cam.start()
+            self.picam = cam
+            self.kind = "Pi Camera (Picamera2)"
+        except Exception as e:
+            print(f"Picamera2 not used ({e}).")
+            self.picam = None
+
+    def _try_usb(self):
+        backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
+        cap = cv2.VideoCapture(CAM_INDEX, backend)
+        if not cap.isOpened():
+            cap.release()
+            return
+        # MJPG lets most USB webcams deliver 30 fps at 640x480 over USB;
+        # raw YUYV often caps lower. Small buffer = less lag.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = cap
+        self.kind = "USB webcam (OpenCV)"
+
+    def read(self):
+        if self.picam is not None:
+            try:
+                return True, self.picam.capture_array()
+            except Exception:
+                return False, None
+        return self.cap.read()
+
+    def release(self):
+        if self.picam is not None:
+            try:
+                self.picam.stop()
+                self.picam.close()
+            except Exception:
+                pass
+        if self.cap is not None:
+            self.cap.release()
+
+
+camera = Camera(CAMERA_SOURCE)
+
+
+# ---------------------------------------------------------------------------
+# TFT display (ILI9341) - drawn on a background thread
+# ---------------------------------------------------------------------------
+def _load_font(path, size):
+    """TrueType font if available, otherwise PIL's tiny built-in font."""
+    try:
+        return ImageFont.truetype(path, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+class TFTDisplay:
+    """Shows the live letter (big) and the confirmed word (bottom).
+
+    A full-screen refresh over SPI takes on the order of 100+ ms, which
+    would stall the camera loop if done inline. So update() only stores the
+    latest (letter, word) and wakes a worker thread that does the drawing;
+    if several updates arrive while it's busy, only the newest is drawn."""
+
+    def __init__(self):
+        def pin(name):
+            return digitalio.DigitalInOut(getattr(board, name))
+
+        cs = pin(TFT_CS) if TFT_CS else None
+        self.disp = ili9341.ILI9341(
+            board.SPI(), rotation=TFT_ROTATION, cs=cs,
+            dc=pin(TFT_DC), rst=pin(TFT_RST), baudrate=TFT_BAUDRATE,
+        )
+
+        # With 90/270 rotation the library reports width/height swapped.
+        if self.disp.rotation % 180 == 90:
+            self.width, self.height = self.disp.height, self.disp.width
+        else:
+            self.width, self.height = self.disp.width, self.disp.height
+
+        self.font_title = _load_font(FONT_BOLD, 18)
+        self.font_letter = _load_font(FONT_BOLD, 140)
+        self.font_word = _load_font(FONT_BOLD, 30)
+
+        self._fill((0, 0, 0))  # also proves SPI works before the thread starts
+
+        self._lock = threading.Lock()
+        self._pending = None
+        self._wake = threading.Event()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def update(self, letter, word):
+        """Cheap and non-blocking; safe to call every frame."""
+        with self._lock:
+            self._pending = (letter, word)
+        self._wake.set()
+
+    def _fill(self, rgb):
+        self.disp.image(Image.new("RGB", (self.width, self.height), rgb))
+
+    def _run(self):
+        last = None
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            if self._stop:
+                return
+            with self._lock:
+                state = self._pending
+            if state is None or state == last:
+                continue
+            try:
+                self._draw(*state)
+                last = state
+            except Exception as e:
+                print(f"TFT drawing stopped after an error: {e}")
+                return
+
+    def _draw(self, letter, word):
+        img = Image.new("RGB", (self.width, self.height), (0, 0, 0))
+        d = ImageDraw.Draw(img)
+
+        # Title bar
+        d.rectangle((0, 0, self.width, 28), fill=(30, 30, 90))
+        d.text((8, 4), "ASL Reader", font=self.font_title, fill=(255, 255, 255))
+
+        # Big centered letter ("?" in orange when nothing is detected)
+        text = letter if letter else "?"
+        color = (0, 255, 0) if letter else (255, 165, 0)
+        l, t, r, b = d.textbbox((0, 0), text, font=self.font_letter)
+        x = (self.width - (r - l)) // 2 - l
+        y = 28 + (self.height - 28 - 50 - (b - t)) // 2 - t
+        d.text((x, y), text, font=self.font_letter, fill=color)
+
+        # Confirmed word along the bottom; drop the oldest letters if it
+        # won't fit.
+        shown = word
+        while shown and d.textlength(shown, font=self.font_word) > self.width - 20:
+            shown = shown[1:]
+        d.line((0, self.height - 48, self.width, self.height - 48), fill=(80, 80, 80))
+        d.text((10, self.height - 42), shown or "-", font=self.font_word, fill=(255, 200, 0))
+
+        self.disp.image(img)
+
+    def close(self):
+        self._stop = True
+        self._wake.set()
+        self._thread.join(timeout=2)
+        try:
+            self._fill((0, 0, 0))
+        except Exception:
+            pass
+
+
+tft = None
+if TFT_ENABLED:
+    try:
+        tft = TFTDisplay()
+        print("TFT display ready.")
+    except Exception as e:
+        print(f"TFT display not available ({e}). Continuing without it.")
+        tft = None
 
 
 # Rolling buffer of recent classifications, used to smooth out single-frame
@@ -420,6 +704,28 @@ def classify_static_letter(f):
         return "Q" if f["orientation"] == "down" else "G"
 
 
+    # R: index + middle straight but crossed. The reliable signal isn't
+    # which way each finger leans from its own knuckle (that's mostly
+    # just hand tilt, not crossing) - it's whether index and middle swap
+    # left/right ORDER between their knuckles and their tips. If finger A
+    # is left-of finger B at the base but right-of it at the tip, they've
+    # crossed. Still the least reliable check in this set (2D projection
+    # of two thin overlapping fingers), but this is a cleaner signal than
+    # the per-finger tilt comparison it replaces.
+    # NOTE: this check now runs BEFORE the H/U/V/K/P block below. It used
+    # to come after it, but that block matches the same finger pattern and
+    # always returns a letter, so R was unreachable.
+    if idx_straight and mid_straight and ring_bent and pinky_bent and idx_mid_gap < 0.22:
+        order_at_base = f["index_mcp"].x - f["middle_mcp"].x
+        order_at_tip = f["index_tip"].x - f["middle_tip"].x
+        # Require a real, measurable left-right gap at the base before
+        # trusting the sign flip - if index_mcp and middle_mcp are
+        # nearly the same x (hand viewed close to edge-on), the sign is
+        # just noise and shouldn't be allowed to decide anything.
+        if abs(order_at_base) > 0.01 and order_at_base * order_at_tip < 0:
+            return "R"
+
+
     # H/U (fingers together) vs V/K/P (fingers apart). See H_V_GAP_LOW/HIGH
     # above: outside the dead zone we commit to a branch and remember it;
     # inside it, we stick with whatever we last committed to instead of
@@ -458,25 +764,6 @@ def classify_static_letter(f):
     # W: index, middle, ring all straight & spread; pinky curled
     if idx_straight and mid_straight and ring_straight and pinky_bent:
         return "W"
-
-
-    # R: index + middle straight but crossed. The reliable signal isn't
-    # which way each finger leans from its own knuckle (that's mostly
-    # just hand tilt, not crossing) - it's whether index and middle swap
-    # left/right ORDER between their knuckles and their tips. If finger A
-    # is left-of finger B at the base but right-of it at the tip, they've
-    # crossed. Still the least reliable check in this set (2D projection
-    # of two thin overlapping fingers), but this is a cleaner signal than
-    # the per-finger tilt comparison it replaces.
-    if idx_straight and mid_straight and ring_bent and pinky_bent and idx_mid_gap < 0.22:
-        order_at_base = f["index_mcp"].x - f["middle_mcp"].x
-        order_at_tip = f["index_tip"].x - f["middle_tip"].x
-        # Require a real, measurable left-right gap at the base before
-        # trusting the sign flip - if index_mcp and middle_mcp are
-        # nearly the same x (hand viewed close to edge-on), the sign is
-        # just noise and shouldn't be allowed to decide anything.
-        if abs(order_at_base) > 0.01 and order_at_base * order_at_tip < 0:
-            return "R"
 
 
     # D: index straight & up alone, thumb touches middle finger (small circle)
@@ -582,6 +869,12 @@ def classify_static_letter(f):
 # ---------------------------------------------------------------------------
 # Motion tracking for J and Z
 # ---------------------------------------------------------------------------
+# Trace points older than this are dropped, so a long hold of the starting
+# handshape can't push the trace past the max_duration checks below (which
+# would make J/Z impossible to trigger until the shape broke and reset).
+MAX_TRACE_SECONDS = 2.0
+
+
 class MotionTracker:
     """Tracks a single fingertip's position (normalized by hand size,
     relative to its position when tracking started) over a short rolling
@@ -594,6 +887,9 @@ class MotionTracker:
 
     def update(self, point, hand_size, t):
         self.buffer.append((t, point.x, point.y, hand_size))
+        # Drop points that have aged out of the time window.
+        while self.buffer and (t - self.buffer[0][0]) > MAX_TRACE_SECONDS:
+            self.buffer.popleft()
 
 
     def clear(self):
@@ -863,6 +1159,7 @@ def stable_letter():
 
 
 debug_mode = False  # toggle with 'd' - shows the raw numbers behind each decision
+current_fps = 0.0   # smoothed frames/second, shown in the debug overlay
 
 
 # Confirm-and-build state: SPACE locks in whatever letter is currently
@@ -892,7 +1189,7 @@ test_start_time = None
 test_last_saved_path = None
 test_complete = False
 test_last_feedback = None        # short-lived "CORRECT" / "Read as X" message
-test_last_feedback_until = 0.0
+test_last_feedback_until = 0.0   # compared against time.monotonic()
 
 
 
@@ -1022,6 +1319,7 @@ def draw_debug_overlay(image, f):
 
 
     lines = [
+        f"FPS {current_fps:4.1f}   camera: {camera.kind}   tft: {'on' if tft else 'off'}",
         f"idx {f['idx']:>7} {f['idx_angle']:5.0f}   mid {f['mid']:>7} {f['mid_angle']:5.0f}",
         f"ring{f['ring']:>7} {f['ring_angle']:5.0f}   pky {f['pinky']:>7} {f['pinky_angle']:5.0f}",
         f"thumb_angle {f['thumb_angle']:5.0f}  ext={f['thumb_extended']}  front={f['thumb_in_front']}",
@@ -1037,10 +1335,10 @@ def draw_debug_overlay(image, f):
         f"Z: shape={is_z_candidate_shape(f)} "
         f"len={z_tracker.path_length():.2f} dur={z_tracker.duration():.2f} pts={len(z_tracker.buffer)}",
     ]
-    y = 170  # pushed down below the "Letter / Last confirmed / Word" lines
+    y = 160  # below the "Letter / Last confirmed / Word" lines
     for line in lines:
-        cv2.putText(image, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        y += 24
+        cv2.putText(image, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+        y += 22
 
 
 
@@ -1049,8 +1347,8 @@ def draw_test_overlay(image):
     """Panel in the top-right showing the current test prompt (or the
     final summary once the alphabet's been run through), plus running
     accuracy, drawn over a translucent box so it stays readable on top
-    of the camera feed."""
-    x0, y0, x1, y1 = 530, 10, 890, 230
+    of the camera feed. Positioned relative to the frame size."""
+    x0, y0, x1, y1 = FRAME_W - 340, 10, FRAME_W - 10, 190
     overlay = image.copy()
     cv2.rectangle(overlay, (x0, y0), (x1, y1), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.65, image, 0.35, 0, image)
@@ -1064,37 +1362,42 @@ def draw_test_overlay(image):
     lines = []
     if test_complete:
         lines.append(("TEST COMPLETE", (0, 255, 0)))
-        lines.append((f"Overall accuracy: {acc_str} ({total_correct}/{total_attempts})", (0, 230, 255)))
+        lines.append((f"Accuracy: {acc_str} ({total_correct}/{total_attempts})", (0, 230, 255)))
         saved_name = os.path.basename(test_last_saved_path) if test_last_saved_path else "-"
-        lines.append((f"Saved: {saved_name}", (0, 230, 255)))
+        lines.append((f"Saved: {saved_name[:26]}", (0, 230, 255)))
         lines.append(("t = restart   s = re-save", (180, 180, 180)))
     else:
         target = current_test_target()
         lines.append((f"SIGN: {target}   ({test_index + 1}/{len(test_order)})", (0, 230, 255)))
-        lines.append((f"Running accuracy: {acc_str} ({total_correct}/{total_attempts})", (0, 230, 255)))
-        if test_last_feedback and time.time() < test_last_feedback_until:
+        lines.append((f"Running: {acc_str} ({total_correct}/{total_attempts})", (0, 230, 255)))
+        if test_last_feedback and time.monotonic() < test_last_feedback_until:
             feedback_color = (0, 255, 0) if test_last_feedback == "CORRECT" else (0, 100, 255)
             lines.append((test_last_feedback, feedback_color))
-        lines.append(("SPACE = log   n = skip   t = stop", (180, 180, 180)))
+        lines.append(("SPACE=log  n=skip  t=stop", (180, 180, 180)))
 
 
-    y = y0 + 32
+    y = y0 + 30
     for text, color in lines:
-        cv2.putText(image, text, (x0 + 14, y), cv2.FONT_HERSHEY_COMPLEX, 0.55, color, 2)
-        y += 32
+        cv2.putText(image, text, (x0 + 12, y), cv2.FONT_HERSHEY_COMPLEX, 0.5, color, 1)
+        y += 30
 
 
 
 
 last_timestamp_ms = 0  # detect_for_video needs strictly increasing timestamps
+last_frame_time = time.monotonic()
 
-while capture.isOpened():
-    ret, frame = capture.read()
-    if not ret:
+if tft:
+    tft.update(None, confirmed_word)  # show the "?" idle screen right away
+
+while True:
+    ret, frame = camera.read()
+    if not ret or frame is None:
         break
 
 
-    frame = cv2.resize(frame, (900, 650))
+    if frame.shape[1] != FRAME_W or frame.shape[0] != FRAME_H:
+        frame = cv2.resize(frame, (FRAME_W, FRAME_H))
     frame = cv2.flip(frame, 1)
 
 
@@ -1102,11 +1405,22 @@ while capture.isOpened():
     image = frame.copy()  # BGR copy we draw overlays on
 
 
-    now = time.time()
+    # Monotonic clock, not time.time(): a Pi without a battery-backed clock
+    # can have its wall time jump (e.g. when NTP syncs after boot), which
+    # would corrupt the J/Z motion timing and break MediaPipe's strictly
+    # increasing timestamps.
+    now = time.monotonic()
     timestamp_ms = int(now * 1000)
     if timestamp_ms <= last_timestamp_ms:
         timestamp_ms = last_timestamp_ms + 1
     last_timestamp_ms = timestamp_ms
+
+
+    dt = now - last_frame_time
+    last_frame_time = now
+    if dt > 0:
+        inst_fps = 1.0 / dt
+        current_fps = inst_fps if current_fps == 0 else 0.9 * current_fps + 0.1 * inst_fps
 
 
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -1151,36 +1465,36 @@ while capture.isOpened():
 
     # -- UI -------------------------------------------------------------
     if shown_letter:
-        cv2.putText(image, f"Letter: {shown_letter}", (15, 60),
-                    cv2.FONT_HERSHEY_COMPLEX, 1.4, (0, 255, 0), 3)
+        cv2.putText(image, f"Letter: {shown_letter}", (10, 50),
+                    cv2.FONT_HERSHEY_COMPLEX, 1.3, (0, 255, 0), 3)
     else:
-        cv2.putText(image, "Letter: ...", (15, 60),
-                    cv2.FONT_HERSHEY_COMPLEX, 1.2, (0, 165, 255), 2)
+        cv2.putText(image, "Letter: ...", (10, 50),
+                    cv2.FONT_HERSHEY_COMPLEX, 1.1, (0, 165, 255), 2)
 
 
     # Last confirmed letter + the word built up so far. These stay on
     # screen regardless of what's currently in frame, since they reflect
     # what you've locked in, not what's live.
     confirmed_display = last_confirmed_letter if last_confirmed_letter else "-"
-    cv2.putText(image, f"Last confirmed: {confirmed_display}", (15, 100),
-                cv2.FONT_HERSHEY_COMPLEX, 0.7, (255, 200, 0), 2)
-    cv2.putText(image, f"Word: {confirmed_word}", (15, 135),
-                cv2.FONT_HERSHEY_COMPLEX, 0.7, (255, 200, 0), 2)
+    cv2.putText(image, f"Last confirmed: {confirmed_display}", (10, 90),
+                cv2.FONT_HERSHEY_COMPLEX, 0.6, (255, 200, 0), 2)
+    cv2.putText(image, f"Word: {confirmed_word}", (10, 125),
+                cv2.FONT_HERSHEY_COMPLEX, 0.6, (255, 200, 0), 2)
 
 
     if test_mode:
         draw_test_overlay(image)
-        cv2.putText(image, "t = stop test   q = quit", (15, 640),
-                    cv2.FONT_HERSHEY_COMPLEX, 0.55, (180, 180, 180), 1)
+        cv2.putText(image, "t = stop test   q = quit", (10, FRAME_H - 10),
+                    cv2.FONT_HERSHEY_COMPLEX, 0.5, (180, 180, 180), 1)
     else:
-        cv2.putText(image, "SPACE = confirm   BKSP = undo   d = debug   t = accuracy test   q = quit",
-                    (15, 640), cv2.FONT_HERSHEY_COMPLEX, 0.5, (180, 180, 180), 1)
+        cv2.putText(image, "SPACE confirm | BKSP undo | d debug | t test | q quit",
+                    (10, FRAME_H - 10), cv2.FONT_HERSHEY_COMPLEX, 0.5, (180, 180, 180), 1)
 
 
     cv2.imshow("ASL Fingerspelling Reader", image)
 
 
-    key = cv2.waitKey(5) & 0xFF
+    key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
     if key == ord('d'):
@@ -1221,7 +1535,7 @@ while capture.isOpened():
                     log_test_attempt(target, shown_letter)
                     _, _, read_as, correct = test_log[-1]
                     test_last_feedback = "CORRECT" if correct else f"Read as {read_as or '(nothing)'}"
-                    test_last_feedback_until = time.time() + 1.2
+                    test_last_feedback_until = time.monotonic() + 1.2
                     if test_index >= len(test_order):
                         test_complete = True
                         test_last_saved_path = save_test_results()
@@ -1237,6 +1551,14 @@ while capture.isOpened():
         last_confirmed_letter = confirmed_word[-1] if confirmed_word else None
 
 
-capture.release()
+    # Push the newest state to the TFT (non-blocking; drawn on its own thread).
+    # Done after key handling so a just-confirmed letter shows up immediately.
+    if tft:
+        tft.update(shown_letter, confirmed_word)
+
+
+if tft:
+    tft.close()
+camera.release()
 landmarker.close()
 cv2.destroyAllWindows()

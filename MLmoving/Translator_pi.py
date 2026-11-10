@@ -12,6 +12,17 @@ Keys:
   ESC            quit
 (Key presses only register when a video window is focused.)
 
+Push buttons (each wired between its GPIO pin and GND; see BUTTON_PINS):
+  CONFIRM  GPIO5  (pin 29)   press once: confirm the current letter
+                             press twice quickly: speak the word
+  SPACE    GPIO6  (pin 31)   press: add a space
+                             hold 1 s: toggle AUTO / MANUAL mode
+  DELETE   GPIO13 (pin 33)   press: delete the last character
+                             hold 1 s: clear the whole word
+  SPEAK    GPIO26 (pin 37)   press: speak the word right away
+The buttons and the keyboard work at the same time. To remap them, edit
+BUTTON_PINS / BUTTON_ACTIONS below.
+
 "Current letter" is what the screens show as "Letter:" - a motion letter
 (J/Z) that was just detected, which stays available for a couple of
 seconds, or otherwise the steadiest recent static prediction. Neither needs
@@ -30,10 +41,10 @@ RASPBERRY PI NOTES
       sudo apt install -y python3-venv python3-opencv python3-picamera2 espeak-ng
       python3 -m venv --system-site-packages .venv
       source .venv/bin/activate
-      pip install mediapipe scikit-learn joblib pyttsx3
+      pip install mediapipe scikit-learn joblib
   Files expected next to this script:
-      hand_features.py, tft_display.py (optional), static_model.joblib,
-      motion_only_model.joblib
+      hand_features.py, asl_speaker.py (your working Speaker class),
+      tft_display.py (optional), static_model.joblib, motion_only_model.joblib
       (hand_landmarker.task is downloaded automatically if missing)
 
   Environment variables:
@@ -45,6 +56,10 @@ RASPBERRY PI NOTES
       ASL_CONFIRM_MIN=0              lowest confidence ENTER will confirm
                                      (default 0 = confirm anything)
       ASL_DOUBLE_ENTER=0.4           seconds allowed between the two ENTERs
+      ASL_BUTTONS=off                ignore the GPIO push buttons
+      ASL_HEADLESS=on                no Camera/Results windows and no
+                                     keyboard (for the finished device;
+                                     buttons + TFT only)
   Example:
       ASL_CAMERA=usb python translator_pi.py
 
@@ -72,6 +87,8 @@ if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY") \
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 import time
+import queue
+import signal
 import threading
 from collections import deque, Counter
 
@@ -81,9 +98,14 @@ import mediapipe as mp
 import numpy as np
 
 try:
-    import pyttsx3
-except Exception:  # not installed / no speech backend
-    pyttsx3 = None
+    import gpiod
+    from gpiod.line import Direction, Bias, Value
+except Exception:  # not on a Pi / libgpiod python bindings missing
+    gpiod = None
+
+# Speech comes from your own asl_speaker.py (the one that works with your
+# speaker). It only needs a Speaker() class with a say(text) method.
+from asl_speaker import Speaker
 
 from hand_features import (
     create_hand_landmarker, draw_landmarks, feature_vector,
@@ -141,6 +163,45 @@ DOUBLE_ENTER_SECONDS = float(os.environ.get("ASL_DOUBLE_ENTER", "0.4"))
 
 # Start in AUTO-accept mode (the original behavior) instead of MANUAL?
 AUTO_ACCEPT_DEFAULT = os.environ.get("ASL_AUTO", "off").lower() == "on"
+
+# --- Push buttons --------------------------------------------------------
+# BCM GPIO numbers (not physical pin numbers). Each button connects its GPIO
+# pin to GND when pressed; the Pi's internal pull-up keeps the pin high
+# otherwise, so no external resistors are needed. These pins don't clash with
+# the TFT (GPIO8/9/10/11/24/25), the IMU (GPIO2/3) or an I2S speaker amp
+# (GPIO18/19/21).
+BUTTON_PINS = {
+    "confirm": 5,    # physical pin 29
+    "space": 6,      # physical pin 31
+    "delete": 13,    # physical pin 33
+    "speak": 26,     # physical pin 37
+}
+# Buttons that also react to being HELD (a second action after 1 second).
+LONG_PRESS_BUTTONS = {"space", "delete"}
+BUTTON_LONG_PRESS_SECONDS = 1.0
+BUTTON_DEBOUNCE_SECONDS = 0.03
+BUTTON_ACTIONS = {
+    ("confirm", "short"): "CONFIRM",       # once = confirm, twice = speak
+    ("speak", "short"): "SPEAK",
+    ("space", "short"): "SPACE",
+    ("space", "long"): "TOGGLE_MODE",      # hold SPACE: AUTO <-> MANUAL
+    ("delete", "short"): "DELETE",
+    ("delete", "long"): "CLEAR",           # hold DELETE: clear the word
+}
+BUTTONS_ENABLED = os.environ.get("ASL_BUTTONS", "on").lower() != "off"
+
+# Finished-device mode: no OpenCV windows and no keyboard polling.
+HEADLESS = os.environ.get("ASL_HEADLESS", "off").lower() == "on"
+
+# Keyboard keys -> the same actions the buttons produce.
+KEY_ACTIONS = {
+    27: "QUIT",                            # ESC
+    8: "DELETE", 127: "DELETE",            # BACKSPACE
+    ord(" "): "SPACE",
+    ord("0"): "CLEAR",
+    ord("a"): "TOGGLE_MODE",
+    13: "CONFIRM", 10: "CONFIRM",          # ENTER
+}
 
 #results window appearance
 RESULTS_WIDTH = 640
@@ -228,39 +289,100 @@ class Camera:
 
 
 # ---------------------------------------------------------------------------
-# Text-to-speech, run on a background thread so the camera never freezes
+# Push buttons (GPIO, via libgpiod)
 # ---------------------------------------------------------------------------
-class Speaker:
-    """pyttsx3's runAndWait() blocks until speech finishes, which used to
-    freeze the camera feed. Here it runs on its own thread, and a second
-    request while it's still talking is ignored instead of piling up."""
+class Buttons:
+    """Reads the push buttons on a background thread (every 5 ms), so even a
+    quick tap is never missed between camera frames. Presses are debounced,
+    and a button listed in LONG_PRESS_BUTTONS gives a second 'long' event
+    when held. poll() returns the actions that happened since last call."""
 
     def __init__(self):
-        self._busy = threading.Lock()
-        if pyttsx3 is None:
-            print("Speech disabled: pyttsx3 not installed "
-                  "(pip install pyttsx3; sudo apt install espeak-ng).")
+        if gpiod is None:
+            raise RuntimeError("python gpiod bindings not available")
 
-    def say(self, text):
-        if pyttsx3 is None:
-            print(f"(speech unavailable) {text}")
-            return
-        if not self._busy.acquire(blocking=False):
-            return  # already speaking
-        threading.Thread(target=self._run, args=(text,), daemon=True).start()
+        self._names = list(BUTTON_PINS)
+        self._offsets = [BUTTON_PINS[n] for n in self._names]
+        settings = gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP)
 
-    def _run(self, text):
+        self._request = None
+        last_error = None
+        # On a Pi 5 the 40-pin header GPIOs are on gpiochip4 (or gpiochip0
+        # on newer kernels), so try both.
+        for chip in ("/dev/gpiochip4", "/dev/gpiochip0"):
+            try:
+                self._request = gpiod.request_lines(
+                    chip, consumer="asl-buttons",
+                    config={offset: settings for offset in self._offsets},
+                )
+                break
+            except Exception as e:
+                last_error = e
+        if self._request is None:
+            raise RuntimeError(f"could not claim the button pins: {last_error}")
+
+        self._events = queue.Queue()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        n = len(self._names)
+        pressed = [False] * n       # debounced state
+        raw_state = [False] * n     # last raw reading
+        raw_since = [0.0] * n       # when the raw reading last changed
+        down_at = [0.0] * n
+        long_sent = [False] * n
+
+        while not self._stop:
+            now = time.monotonic()
+            try:
+                values = self._request.get_values(self._offsets)
+            except Exception:
+                time.sleep(0.05)
+                continue
+
+            for i, name in enumerate(self._names):
+                raw = values[i] == Value.INACTIVE   # pulled to GND = pressed
+                if raw != raw_state[i]:
+                    raw_state[i] = raw
+                    raw_since[i] = now
+                elif raw != pressed[i] and (now - raw_since[i]) >= BUTTON_DEBOUNCE_SECONDS:
+                    pressed[i] = raw
+                    if raw:                          # press accepted
+                        down_at[i] = now
+                        long_sent[i] = False
+                        if name not in LONG_PRESS_BUTTONS:
+                            self._events.put((name, "short"))
+                    elif name in LONG_PRESS_BUTTONS and not long_sent[i]:
+                        self._events.put((name, "short"))   # released before 1 s
+
+                if (pressed[i] and name in LONG_PRESS_BUTTONS and not long_sent[i]
+                        and (now - down_at[i]) >= BUTTON_LONG_PRESS_SECONDS):
+                    long_sent[i] = True
+                    self._events.put((name, "long"))
+
+            time.sleep(0.005)
+
+    def poll(self):
+        actions = []
+        while True:
+            try:
+                name, kind = self._events.get_nowait()
+            except queue.Empty:
+                break
+            action = BUTTON_ACTIONS.get((name, kind))
+            if action:
+                actions.append(action)
+        return actions
+
+    def close(self):
+        self._stop = True
+        self._thread.join(timeout=1)
         try:
-            engine = pyttsx3.init()
-            engine.say(text)
-            engine.runAndWait()
-            engine.stop()
-        except Exception as e:
-            print(f"Speech failed: {e} "
-                  "(is espeak-ng installed, and is the speaker set up as the "
-                  "default audio output? try: aplay -l)")
-        finally:
-            self._busy.release()
+            self._request.release()
+        except Exception:
+            pass
 
 
 def most_active_fingertip_motion(buffer):
@@ -370,6 +492,26 @@ def main():
         except Exception as e:
             print(f"TFT display not available ({e}). Continuing without it.")
 
+    # Optional push buttons; the keyboard keeps working either way.
+    buttons = None
+    if BUTTONS_ENABLED:
+        try:
+            buttons = Buttons()
+            pin_list = ", ".join(f"{name}=GPIO{pin}" for name, pin in BUTTON_PINS.items())
+            print(f"Buttons ready ({pin_list}).")
+        except Exception as e:
+            print(f"Buttons not available ({e}). Keyboard only.")
+
+    # Ctrl+C or a systemd stop (SIGTERM) now ends the loop cleanly, so the
+    # camera, buttons and TFT get shut down properly.
+    stop_flag = {"stop": False}
+
+    def _request_stop(signum, frame):
+        stop_flag["stop"] = True
+
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
+
     start_time = time.monotonic()
     last_timestamp_ms = -1
     last_frame_time = start_time
@@ -394,12 +536,13 @@ def main():
     pending_enter_letter = None
 
     print(f"Mode: {'AUTO' if auto_mode else 'MANUAL'} "
-          "(press 'a' to switch; ENTER confirms, ENTER twice speaks)")
+          "(hold SPACE or press 'a' to switch; CONFIRM/ENTER confirms, "
+          "twice speaks)")
 
     if tft:
         tft.update(make_ui_state(None, 0.0, None, 0.0, None, None, auto_mode, word))
 
-    while True:
+    while not stop_flag["stop"]:
         ok, frame = camera.read()
         if not ok or frame is None:
             print("ERROR: Could not read frame from camera")
@@ -517,53 +660,86 @@ def main():
             pending_enter_letter = None
 
         #  keys 
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC
-            break
-        elif key == 8 or key == 127:  # backspace
-            word = word[:-1]
-            last_confirmed_letter = word[-1] if word and word[-1] != " " else None
-        elif key == ord(" "):
-            word += " "
-        elif key == ord("0"):
-            word = ""
-            last_confirmed_letter = None
-        elif key == ord("a"):
-            auto_mode = not auto_mode
-            state = "READY"
-            static_buffer.clear()
-            motion_buffer.clear()
-            print(f"Mode: {'AUTO' if auto_mode else 'MANUAL'}")
-        elif key in (13, 10):  # ENTER
-            if pending_enter_at is not None and (now - pending_enter_at) <= DOUBLE_ENTER_SECONDS:
-                # second press: speak the word instead of confirming a letter
-                pending_enter_at = None
-                pending_enter_letter = None
+        # Keyboard keys and push buttons both produce the same named actions.
+        actions = []
+        if not HEADLESS:
+            key = cv2.waitKey(1) & 0xFF
+            key_action = KEY_ACTIONS.get(key)
+            if key_action:
+                actions.append(key_action)
+        if buttons:
+            actions.extend(buttons.poll())
+
+        for action in actions:
+            if action == "QUIT":
+                stop_flag["stop"] = True
+
+            elif action == "DELETE":
+                word = word[:-1]
+                last_confirmed_letter = word[-1] if word and word[-1] != " " else None
+
+            elif action == "SPACE":
+                word += " "
+
+            elif action == "CLEAR":
+                word = ""
+                last_confirmed_letter = None
+
+            elif action == "TOGGLE_MODE":
+                auto_mode = not auto_mode
+                state = "READY"
+                static_buffer.clear()
+                motion_buffer.clear()
+                print(f"Mode: {'AUTO' if auto_mode else 'MANUAL'}")
+
+            elif action == "SPEAK":
+                # a letter still waiting out the double-press window is
+                # applied first, so it's included in what gets spoken
+                if pending_enter_at is not None:
+                    if pending_enter_letter:
+                        word += pending_enter_letter
+                        last_confirmed_letter = pending_enter_letter
+                    pending_enter_at = None
+                    pending_enter_letter = None
                 if word.strip():
                     speaker.say(word)  # background thread; camera keeps going
                 else:
                     print("Nothing to speak yet.")
-            else:
-                # first press: remember the letter showing right now and
-                # wait briefly for a possible second press
-                pending_enter_at = now
-                pending_enter_letter = current_letter
+
+            elif action == "CONFIRM":
+                if pending_enter_at is not None and (now - pending_enter_at) <= DOUBLE_ENTER_SECONDS:
+                    # second press: speak the word instead of confirming a letter
+                    pending_enter_at = None
+                    pending_enter_letter = None
+                    if word.strip():
+                        speaker.say(word)
+                    else:
+                        print("Nothing to speak yet.")
+                else:
+                    # first press: remember the letter showing right now and
+                    # wait briefly for a possible second press
+                    pending_enter_at = now
+                    pending_enter_letter = current_letter
 
         
         cv2.putText(frame, f"{fps:4.1f} fps", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0, 255, 255), 2)
-        cv2.imshow("Camera", frame)  
+        if not HEADLESS:
+            cv2.imshow("Camera", frame)  
 
         ui_state = make_ui_state(static_letter, static_confidence,
                                  motion_letter, motion_confidence,
                                  current_letter, last_confirmed_letter,
                                  auto_mode, word)
-        cv2.imshow("Results", build_results_frame(ui_state))
+        if not HEADLESS:
+            cv2.imshow("Results", build_results_frame(ui_state))
 
         # The TFT shows exactly what the Results window shows.
         if tft:
             tft.update(ui_state)
 
+    if buttons:
+        buttons.close()
     if tft:
         tft.close()
     camera.release()

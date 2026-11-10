@@ -1,6 +1,7 @@
 """
 Keys:
   1/2/3   set current label to J / Z / NONE
+  4/5/6   set current label to YES / NO / HELLO
   ENTER   record one motion buffer
   ESC     quit
 """
@@ -29,6 +30,9 @@ LABEL_KEYS = {
     ord("1"): "J",
     ord("2"): "Z",
     ord("3"): "NONE",
+    ord("4"): "YES",
+    ord("5"): "NO",
+    ord("6"): "HELLO",
 }
 
 
@@ -56,7 +60,7 @@ def main():
     record_start = 0.0
     counts = {}
 
-    print("Started. 1=J 2=Z 3=NONE, ENTER=record, ESC=quit.")
+    print("Started. 1=J 2=Z 3=NONE 4=YES 5=NO 6=HELLO, ENTER=record, ESC=quit.")
 
     while True:
         ok, frame = cap.read()
@@ -102,7 +106,7 @@ def main():
             print(f"Label set to '{current_label}'")
         elif key in (KEY_ENTER, KEY_ENTER_ALT) and not recording:
             if current_label is None:
-                print("Set a label first (1=J, 2=Z, 3=NONE)")
+                print("Set a label first (1=J, 2=Z, 3=NONE, 4=YES, 5=NO, 6=HELLO)")
             else:
                 recording = True
                 buffer = []

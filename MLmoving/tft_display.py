@@ -50,8 +50,8 @@ COLOR_WORD = (255, 255, 255)
 COLOR_HINT = (150, 150, 150)
 
 HINT_LINES = (
-    "ENTER confirm   ENTER x2 speak   BKSP delete",
-    "SPACE space   0 clear   a auto/manual   ESC quit",
+    "CONFIRM (x2 = speak)    SPEAK",
+    "SPACE (hold: mode)   DELETE (hold: clear)",
 )
 
 

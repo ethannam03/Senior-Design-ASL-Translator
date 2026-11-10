@@ -1,3 +1,7 @@
+import os
+import sys
+import urllib.request
+
 import cv2
 import numpy as np
 from mediapipe.tasks import python as mp_python
@@ -18,7 +22,11 @@ FINGERTIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 NUM_LANDMARKS = 21
 
 
-MODEL_PATH = 'hand_landmarker.task'
+# Resolved next to this file, so it works no matter which folder the script
+# is launched from (VS Code, a desktop shortcut, autostart, ...).
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hand_landmarker.task')
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+             "hand_landmarker/float16/latest/hand_landmarker.task")
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),          
@@ -29,7 +37,28 @@ HAND_CONNECTIONS = [
     (0, 17),                                 
 ]
 
+
+def ensure_model():
+    """Download the hand model next to this file if it isn't there yet."""
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1_000_000:
+        return
+    print(f"Model not found at {MODEL_PATH}; downloading (~8 MB)...")
+    tmp_path = MODEL_PATH + ".part"
+    try:
+        urllib.request.urlretrieve(MODEL_URL, tmp_path)
+        os.replace(tmp_path, MODEL_PATH)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        sys.exit(
+            f"Could not download the model automatically ({e}).\n"
+            "Download it manually with:\n"
+            f"  wget -O hand_landmarker.task {MODEL_URL}"
+        )
+
+
 def create_hand_landmarker():
+    ensure_model()
     base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     options = mp_vision.HandLandmarkerOptions(
         base_options=base_options,

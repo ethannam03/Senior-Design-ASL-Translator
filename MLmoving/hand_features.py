@@ -1,3 +1,7 @@
+import os
+import sys
+import urllib.request
+
 import cv2
 import numpy as np
 from mediapipe.tasks import python as mp_python
@@ -18,7 +22,11 @@ FINGERTIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 NUM_LANDMARKS = 21
 
 
-MODEL_PATH = 'hand_landmarker.task'
+# Resolved next to this file, so it works no matter which folder the script
+# is launched from (VS Code, a desktop shortcut, autostart, ...).
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hand_landmarker.task')
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+             "hand_landmarker/float16/latest/hand_landmarker.task")
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),          
@@ -29,7 +37,28 @@ HAND_CONNECTIONS = [
     (0, 17),                                 
 ]
 
+
+def ensure_model():
+    """Download the hand model next to this file if it isn't there yet."""
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1_000_000:
+        return
+    print(f"Model not found at {MODEL_PATH}; downloading (~8 MB)...")
+    tmp_path = MODEL_PATH + ".part"
+    try:
+        urllib.request.urlretrieve(MODEL_URL, tmp_path)
+        os.replace(tmp_path, MODEL_PATH)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        sys.exit(
+            f"Could not download the model automatically ({e}).\n"
+            "Download it manually with:\n"
+            f"  wget -O hand_landmarker.task {MODEL_URL}"
+        )
+
+
 def create_hand_landmarker():
+    ensure_model()
     base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     options = mp_vision.HandLandmarkerOptions(
         base_options=base_options,
@@ -101,15 +130,17 @@ def most_changed_point(sequence):
     return max(all_motion, key=all_motion.get)
 
 
-def motion_vector(sequence):
-    #returns vector summary of motion
-
-    sequence = np.array(sequence, dtype=np.float32)
-    activePoint = most_changed_point(sequence)
-    trajectory = sequence[:, activePoint, :2]#only x,y coordinates
+def _trajectory_features(trajectory):
+    """
+    trajectory: (T, 2) array of x,y positions for ONE point across the
+    whole motion buffer. Returns the same 11 summary numbers that used to
+    only get computed for whichever single point moved the most -- this
+    is now called once PER FINGERTIP, so every finger's own movement
+    pattern gets captured instead of just one "winner" point.
+    """
     differences = np.diff(trajectory, axis=0)
 
-    start,end = trajectory[0], trajectory[-1]
+    start, end = trajectory[0], trajectory[-1]
     net_motion = end - start
     net_motion_magnitude = np.linalg.norm(net_motion)
 
@@ -129,25 +160,48 @@ def motion_vector(sequence):
         if len(signs) < 2:
             return 0
 
-        return np.sum(signs[1:] != signs[:-1])
+        return float(np.sum(signs[1:] != signs[:-1]))
 
     xReversals, yReversals = reversals(differences[:, 0]), reversals(differences[:, 1])
 
     maxSpeed = float(np.max(step_lengths)) if len(step_lengths) > 0 else 0.0
     meanSpeed = float(np.mean(step_lengths)) if len(step_lengths) > 0 else 0.0
 
-    return np.array([net_motion[0],net_motion[1],net_motion_magnitude,
-                     path_length,straightness,bounding_box_X,bounding_box_Y,
-                     xReversals,yReversals,maxSpeed,meanSpeed], dtype=np.float32)
+    return [net_motion[0], net_motion[1], net_motion_magnitude,
+            path_length, straightness, bounding_box_X, bounding_box_Y,
+            xReversals, yReversals, maxSpeed, meanSpeed]
 
 
-#names  of vector feature in order of the vector returned by motion_vector
-MOTION_FEATURE_NAME_ORDER = [
+def motion_vector(sequence):
+    #returns vector summary of motion for all 5 fingertips 
+
+    sequence = np.array(sequence, dtype=np.float32)
+
+    all_features = []
+    for idx in FINGERTIPS:
+        trajectory = sequence[:, idx, :2]  # only x,y coordinates
+        all_features.extend(_trajectory_features(trajectory))
+
+    return np.array(all_features, dtype=np.float32)
+
+
+# matches the order of FINGERTIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
+_FINGERTIP_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
+
+_PER_FINGERTIP_FEATURE_NAMES = [
     "net_dx", "net_dy", "net_motion_magnitude",
     "path_length", "straightness",
     "bounding_box_X", "bounding_box_Y",
     "xReversals", "yReversals",
     "maxSpeed", "meanSpeed",
+]
+
+#names of vector features in order of the vector returned by motion_vector --
+#now 5 fingertips x 11 features each = 55 total, e.g. "thumb_net_dx", "index_path_length", ...
+MOTION_FEATURE_NAME_ORDER = [
+    f"{finger}_{name}"
+    for finger in _FINGERTIP_NAMES
+    for name in _PER_FINGERTIP_FEATURE_NAMES
 ]
 
 #names of static features in order of the vector returned by feature_vector, for example lm0_x

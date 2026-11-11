@@ -48,6 +48,7 @@ COLOR_MOTION = (255, 165, 0)
 COLOR_STATUS = (0, 200, 255)
 COLOR_WORD = (255, 255, 255)
 COLOR_HINT = (150, 150, 150)
+COLOR_ASLEEP = (255, 60, 60)
 
 HINT_LINES = (
     "CONFIRM (x2 = speak)    SPEAK",
@@ -177,7 +178,11 @@ class TFTDisplay:
 
         d.text((8, 6), static_text, font=self.font_line, fill=COLOR_STATIC)
         d.text((8, 34), motion_text, font=self.font_line, fill=COLOR_MOTION)
-        d.text((8, 64), status_text, font=self.font_status, fill=COLOR_STATUS)
+        status_color = COLOR_STATUS
+        if s.get("asleep"):
+            status_text = "CAMERA OFF - move to wake"
+            status_color = COLOR_ASLEEP
+        d.text((8, 64), status_text, font=self.font_status, fill=status_color)
 
         # Word, wrapped; if it's too long, the newest 3 lines are shown.
         word_lines = self._wrap(d, f"Word: {s['word']}", self.font_word, self.width - 16)

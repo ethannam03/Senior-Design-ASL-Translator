@@ -41,10 +41,11 @@ RASPBERRY PI NOTES
       sudo apt install -y python3-venv python3-opencv python3-picamera2 espeak-ng
       python3 -m venv --system-site-packages .venv
       source .venv/bin/activate
-      pip install mediapipe scikit-learn joblib
+      pip install mediapipe scikit-learn joblib smbus2
   Files expected next to this script:
       hand_features.py, asl_speaker.py (your working Speaker class),
-      tft_display.py (optional), static_model.joblib, motion_only_model.joblib
+      tft_display.py and imu_motion.py (both optional),
+      static_model.joblib, motion_only_model.joblib
       (hand_landmarker.task is downloaded automatically if missing)
 
   Environment variables:
@@ -60,6 +61,12 @@ RASPBERRY PI NOTES
       ASL_HEADLESS=on                no Camera/Results windows and no
                                      keyboard (for the finished device;
                                      buttons + TFT only)
+      ASL_IMU=off                    don't use the IMU (camera always on)
+      ASL_IMU_IDLE_SECONDS=5         still time before the camera turns off
+      ASL_IMU_ADDR=0x28              BNO055 I2C address
+      ASL_IMU_ACCEL=0.5              linear accel (m/s^2) that counts as motion
+      ASL_IMU_GYRO=15                rotation (deg/s) that counts as motion
+      ASL_HAND_KEEPS_AWAKE=on        a hand in view also keeps the camera on
   Example:
       ASL_CAMERA=usb python translator_pi.py
 
@@ -192,6 +199,20 @@ BUTTONS_ENABLED = os.environ.get("ASL_BUTTONS", "on").lower() != "off"
 
 # Finished-device mode: no OpenCV windows and no keyboard polling.
 HEADLESS = os.environ.get("ASL_HEADLESS", "off").lower() == "on"
+
+# --- IMU power saving ----------------------------------------------------
+# The camera is switched off when the IMU (BNO055 on I2C) hasn't moved for
+# IMU_IDLE_SECONDS, and switched back on at the next movement. Everything
+# else (buttons, keyboard, speaker, TFT) keeps working while it's off.
+IMU_ENABLED = os.environ.get("ASL_IMU", "on").lower() != "off"
+IMU_IDLE_SECONDS = float(os.environ.get("ASL_IMU_IDLE_SECONDS", "5"))
+IMU_ADDR = int(os.environ.get("ASL_IMU_ADDR", "0x28"), 0)
+IMU_ACCEL_THRESH = float(os.environ.get("ASL_IMU_ACCEL", "0.5"))   # m/s^2
+IMU_GYRO_THRESH = float(os.environ.get("ASL_IMU_GYRO", "15"))      # deg/s
+# Optional: seeing a hand in the camera also counts as activity, so holding
+# a static sign perfectly still never puts the camera to sleep.
+HAND_KEEPS_AWAKE = os.environ.get("ASL_HAND_KEEPS_AWAKE", "off").lower() == "on"
+WAKE_RETRY_SECONDS = 2.0   # if the camera can't be reopened, try again after this
 
 # Keyboard keys -> the same actions the buttons produce.
 KEY_ACTIONS = {
@@ -385,6 +406,14 @@ class Buttons:
             pass
 
 
+class _NoHands:
+    """Stands in for a MediaPipe result while the camera is switched off."""
+    hand_landmarks = []
+
+
+_NO_HANDS = _NoHands()
+
+
 def most_active_fingertip_motion(buffer):
     """Cheap motion-energy estimate -- just enough to decide whether to
     bother running the motion classifier this frame."""
@@ -415,7 +444,7 @@ def stable_static_letter(static_buffer):
 
 
 def make_ui_state(static_letter, static_confidence, motion_letter, motion_confidence,
-                  current_letter, confirmed_letter, auto_mode, word):
+                  current_letter, confirmed_letter, auto_mode, word, asleep=False):
     """Everything the Results window and the TFT display show."""
     return {
         "static": (static_letter, round(float(static_confidence), 3)),
@@ -424,6 +453,7 @@ def make_ui_state(static_letter, static_confidence, motion_letter, motion_confid
         "confirmed": confirmed_letter,
         "mode": "AUTO" if auto_mode else "MANUAL",
         "word": word,
+        "asleep": asleep,
     }
 
 
@@ -440,6 +470,9 @@ def build_results_frame(s):
     status_text = (f"Letter: {s['current'] or '-'}    "
                    f"Last confirmed: {s['confirmed'] or '-'}    [{s['mode']}]")
     word_text = f"Word: {s['word']}"
+    if s.get("asleep"):
+        cv2.putText(canvas, "CAMERA OFF - move the device to wake", (20, 172),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
     cv2.putText(canvas, static_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX,
                 0.9, (0, 255, 0), 2)
@@ -502,6 +535,21 @@ def main():
         except Exception as e:
             print(f"Buttons not available ({e}). Keyboard only.")
 
+    # Optional IMU: turns the camera off after IMU_IDLE_SECONDS without
+    # movement. If it isn't there, the camera simply stays on.
+    imu = None
+    if IMU_ENABLED:
+        try:
+            from imu_motion import IMUMotionMonitor
+            imu = IMUMotionMonitor(addr=IMU_ADDR, accel_thresh=IMU_ACCEL_THRESH,
+                                   gyro_thresh=IMU_GYRO_THRESH)
+            print(f"IMU ready: the camera turns off after "
+                  f"{IMU_IDLE_SECONDS:g} s without motion.")
+        except Exception as e:
+            print(f"IMU not available ({e}). The camera will stay on.")
+    camera_asleep = False
+    next_wake_try = 0.0
+
     # Ctrl+C or a systemd stop (SIGTERM) now ends the loop cleanly, so the
     # camera, buttons and TFT get shut down properly.
     stop_flag = {"stop": False}
@@ -543,11 +591,43 @@ def main():
         tft.update(make_ui_state(None, 0.0, None, 0.0, None, None, auto_mode, word))
 
     while not stop_flag["stop"]:
-        ok, frame = camera.read()
-        if not ok or frame is None:
-            print("ERROR: Could not read frame from camera")
-            break
-        frame = cv2.flip(frame, 1)
+        # -- IMU power saving: camera off after IMU_IDLE_SECONDS of stillness,
+        # back on at the next movement. If the IMU stops answering, it's
+        # treated as "active" so the camera is never left off by mistake.
+        if imu is not None:
+            t_now = time.monotonic()
+            idle = imu.healthy() and imu.seconds_since_motion() >= IMU_IDLE_SECONDS
+            if idle and not camera_asleep:
+                camera.release()
+                camera = None
+                camera_asleep = True
+                static_buffer.clear()
+                motion_buffer.clear()
+                pinned_motion_until = 0.0
+                print(f"No IMU motion for {IMU_IDLE_SECONDS:g} s - camera off.")
+            elif camera_asleep and not idle and t_now >= next_wake_try:
+                try:
+                    camera = Camera(CAMERA_SOURCE)
+                    camera_asleep = False
+                    fps = 0.0
+                    last_frame_time = t_now
+                    print("IMU motion - camera on.")
+                except SystemExit:
+                    camera = None
+                    next_wake_try = t_now + WAKE_RETRY_SECONDS
+                    print("Could not reopen the camera yet; will retry.")
+
+        if camera_asleep:
+            # Nothing to capture: use a black frame, skip MediaPipe, and
+            # idle gently. Buttons, keys and the TFT are still handled below.
+            frame = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
+            time.sleep(0.02)
+        else:
+            ok, frame = camera.read()
+            if not ok or frame is None:
+                print("ERROR: Could not read frame from camera")
+                break
+            frame = cv2.flip(frame, 1)
         rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
@@ -559,7 +639,9 @@ def main():
         if timestamp_ms <= last_timestamp_ms:
             timestamp_ms = last_timestamp_ms + 1
         last_timestamp_ms = timestamp_ms
-        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        result = _NO_HANDS if camera_asleep else landmarker.detect_for_video(mp_image, timestamp_ms)
+        if HAND_KEEPS_AWAKE and imu is not None and result.hand_landmarks:
+            imu.poke()
 
         dt = now - last_frame_time
         last_frame_time = now
@@ -722,15 +804,19 @@ def main():
                     pending_enter_letter = current_letter
 
         
-        cv2.putText(frame, f"{fps:4.1f} fps", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 255), 2)
+        if camera_asleep:
+            cv2.putText(frame, "CAMERA OFF - move the device to wake", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        else:
+            cv2.putText(frame, f"{fps:4.1f} fps", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 255), 2)
         if not HEADLESS:
             cv2.imshow("Camera", frame)  
 
         ui_state = make_ui_state(static_letter, static_confidence,
                                  motion_letter, motion_confidence,
                                  current_letter, last_confirmed_letter,
-                                 auto_mode, word)
+                                 auto_mode, word, asleep=camera_asleep)
         if not HEADLESS:
             cv2.imshow("Results", build_results_frame(ui_state))
 
@@ -742,7 +828,10 @@ def main():
         buttons.close()
     if tft:
         tft.close()
-    camera.release()
+    if imu:
+        imu.close()
+    if camera is not None:
+        camera.release()
     cv2.destroyAllWindows()
     landmarker.close()
 
